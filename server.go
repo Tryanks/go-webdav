@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -51,6 +52,17 @@ type LockSystem interface {
 	HasConflictingLock(path string, depth internal.Depth, excludeToken string) bool
 }
 
+// getDecodedPath returns the URL-decoded path from the Fiber context
+func getDecodedPath(c *fiber.Ctx) string {
+	path := c.Path()
+	decoded, err := url.PathUnescape(path)
+	if err != nil {
+		// If decoding fails, return the original path
+		return path
+	}
+	return decoded
+}
+
 // Handler handles WebDAV HTTP requests. It can be used to create a WebDAV
 // server.
 type Handler struct {
@@ -86,7 +98,7 @@ type backend struct {
 func (b *backend) Options(c *fiber.Ctx) (caps []string, allow []string, err error) {
 	caps = []string{"2"}
 
-	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
+	fi, err := b.FileSystem.Stat(c.Context(), getDecodedPath(c))
 	if internal.IsNotFound(err) {
 		// For non-existent resources, allow creation methods
 		return caps, []string{
@@ -123,7 +135,7 @@ func (b *backend) Options(c *fiber.Ctx) (caps []string, allow []string, err erro
 }
 
 func (b *backend) HeadGet(c *fiber.Ctx) error {
-	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
+	fi, err := b.FileSystem.Stat(c.Context(), getDecodedPath(c))
 	if err != nil {
 		return err
 	}
@@ -131,7 +143,7 @@ func (b *backend) HeadGet(c *fiber.Ctx) error {
 		return &internal.HTTPError{Code: fiber.StatusMethodNotAllowed}
 	}
 
-	f, err := b.FileSystem.Open(c.Context(), c.Path())
+	f, err := b.FileSystem.Open(c.Context(), getDecodedPath(c))
 	if err != nil {
 		return err
 	}
@@ -167,14 +179,14 @@ func (b *backend) HeadGet(c *fiber.Ctx) error {
 func (b *backend) PropFind(c *fiber.Ctx, propfind *internal.PropFind, depth internal.Depth) (*internal.MultiStatus, error) {
 	// TODO: use partial error Response on error
 
-	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
+	fi, err := b.FileSystem.Stat(c.Context(), getDecodedPath(c))
 	if err != nil {
 		return nil, err
 	}
 
 	var resps []internal.Response
 	if depth != internal.DepthZero && fi.IsDir {
-		children, err := b.FileSystem.ReadDir(c.Context(), c.Path(), depth == internal.DepthInfinity)
+		children, err := b.FileSystem.ReadDir(c.Context(), getDecodedPath(c), depth == internal.DepthInfinity)
 		if err != nil {
 			return nil, err
 		}
@@ -245,7 +257,7 @@ func (b *backend) propFindFile(propfind *internal.PropFind, fi *FileInfo) (*inte
 }
 
 func (b *backend) PropPatch(c *fiber.Ctx, update *internal.PropertyUpdate) (*internal.Response, error) {
-	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
+	fi, err := b.FileSystem.Stat(c.Context(), getDecodedPath(c))
 	if err != nil {
 		return nil, err
 	}
@@ -350,7 +362,7 @@ func (b *backend) Put(c *fiber.Ctx) error {
 		body = &bodyStreamWrapper{strings.NewReader("")}
 	}
 
-	fi, created, err := b.FileSystem.Create(c.Context(), c.Path(), body, &opts)
+	fi, created, err := b.FileSystem.Create(c.Context(), getDecodedPath(c), body, &opts)
 	if err != nil {
 		return err
 	}
@@ -382,14 +394,14 @@ func (b *backend) Delete(c *fiber.Ctx) error {
 		IfNoneMatch: ifNoneMatch,
 		IfMatch:     ifMatch,
 	}
-	return b.FileSystem.RemoveAll(c.Context(), c.Path(), &opts)
+	return b.FileSystem.RemoveAll(c.Context(), getDecodedPath(c), &opts)
 }
 
 func (b *backend) Mkcol(c *fiber.Ctx) error {
 	if c.Get("Content-Type") != "" {
 		return internal.HTTPErrorf(fiber.StatusUnsupportedMediaType, "webdav: request body not supported in MKCOL request")
 	}
-	err := b.FileSystem.Mkdir(c.Context(), c.Path())
+	err := b.FileSystem.Mkdir(c.Context(), getDecodedPath(c))
 	if internal.IsNotFound(err) {
 		return &internal.HTTPError{Code: fiber.StatusConflict, Err: err}
 	}
@@ -401,7 +413,7 @@ func (b *backend) Copy(c *fiber.Ctx, dest *internal.Href, recursive, overwrite b
 		NoRecursive: !recursive,
 		NoOverwrite: !overwrite,
 	}
-	created, err = b.FileSystem.Copy(c.Context(), c.Path(), dest.Path, &options)
+	created, err = b.FileSystem.Copy(c.Context(), getDecodedPath(c), dest.Path, &options)
 	if os.IsExist(err) {
 		return false, &internal.HTTPError{fiber.StatusPreconditionFailed, err}
 	}
@@ -412,7 +424,7 @@ func (b *backend) Move(c *fiber.Ctx, dest *internal.Href, overwrite bool) (creat
 	options := MoveOptions{
 		NoOverwrite: !overwrite,
 	}
-	created, err = b.FileSystem.Move(c.Context(), c.Path(), dest.Path, &options)
+	created, err = b.FileSystem.Move(c.Context(), getDecodedPath(c), dest.Path, &options)
 	if os.IsExist(err) {
 		return false, &internal.HTTPError{fiber.StatusPreconditionFailed, err}
 	}
@@ -420,7 +432,7 @@ func (b *backend) Move(c *fiber.Ctx, dest *internal.Href, overwrite bool) (creat
 }
 
 func (b *backend) Lock(c *fiber.Ctx, depth internal.Depth, timeout time.Duration, refreshToken string) (lock *internal.Lock, created bool, err error) {
-	return b.LockSystem.Lock(c.Path(), depth, timeout, refreshToken)
+	return b.LockSystem.Lock(getDecodedPath(c), depth, timeout, refreshToken)
 }
 
 func (b *backend) Unlock(c *fiber.Ctx, tokenHref string) error {
@@ -499,7 +511,7 @@ func servePrincipalPropfind(c *fiber.Ctx, options *ServePrincipalOptions) error 
 		}
 	}
 
-	resp, err := internal.NewPropFindResponse(c.Path(), &propfind, props)
+	resp, err := internal.NewPropFindResponse(getDecodedPath(c), &propfind, props)
 	if err != nil {
 		return err
 	}

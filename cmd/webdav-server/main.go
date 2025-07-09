@@ -3,6 +3,7 @@ package main
 import (
 	"flag"
 	"fmt"
+	"github.com/gofiber/fiber/v2/middleware/logger"
 	"log"
 	"os"
 
@@ -53,6 +54,7 @@ func main() {
 		DisableHeaderNormalizing: true,
 		RequestMethods:           ExtendedMethods,
 	})
+	app.Use(logger.New())
 	app.Use("/*", func(c *fiber.Ctx) error {
 		return handler.Handle(c)
 	})
