@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
@@ -13,6 +12,8 @@ import (
 	"github.com/emersion/go-webdav/internal"
 	"github.com/gofiber/fiber/v2"
 )
+
+const TimeFormat string = "Mon, 02 Jan 2006 15:04:05 GMT"
 
 // bodyStreamWrapper wraps an io.Reader to implement io.ReadCloser
 type bodyStreamWrapper struct {
@@ -87,21 +88,35 @@ func (b *backend) Options(c *fiber.Ctx) (caps []string, allow []string, err erro
 
 	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
 	if internal.IsNotFound(err) {
-		return caps, []string{fiber.MethodOptions, fiber.MethodPut, "MKCOL"}, nil
+		// For non-existent resources, allow creation methods
+		return caps, []string{
+			fiber.MethodOptions,
+			fiber.MethodPut,
+			"MKCOL",
+			"PROPFIND",
+		}, nil
 	} else if err != nil {
 		return nil, nil, err
 	}
 
+	// Base methods supported for all resources
 	allow = []string{
 		fiber.MethodOptions,
 		fiber.MethodDelete,
 		"PROPFIND",
+		"PROPPATCH",
 		"COPY",
 		"MOVE",
+		"LOCK",
+		"UNLOCK",
 	}
 
 	if !fi.IsDir {
+		// File-specific methods
 		allow = append(allow, fiber.MethodHead, fiber.MethodGet, fiber.MethodPut)
+	} else {
+		// Directory-specific methods
+		allow = append(allow, "MKCOL")
 	}
 
 	return caps, allow, nil
@@ -127,7 +142,7 @@ func (b *backend) HeadGet(c *fiber.Ctx) error {
 		c.Set("Content-Type", fi.MIMEType)
 	}
 	if !fi.ModTime.IsZero() {
-		c.Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
+		c.Set("Last-Modified", fi.ModTime.UTC().Format(TimeFormat))
 	}
 	if fi.ETag != "" {
 		c.Set("ETag", internal.ETag(fi.ETag).String())
@@ -237,6 +252,22 @@ func (b *backend) PropPatch(c *fiber.Ctx, update *internal.PropertyUpdate) (*int
 
 	resp := &internal.Response{Hrefs: []internal.Href{internal.Href{Path: fi.Path}}}
 
+	// Define modifiable properties according to RFC 4918
+	modifiableProps := map[xml.Name]bool{
+		{Space: "DAV:", Local: "displayname"}: true,
+		// Add other modifiable properties as needed
+	}
+
+	// Define protected properties that cannot be modified
+	protectedProps := map[xml.Name]bool{
+		internal.GetContentLengthName: true,
+		internal.GetLastModifiedName:  true,
+		internal.GetETagName:          true,
+		internal.GetContentTypeName:   true,
+		internal.ResourceTypeName:     true,
+		internal.SupportedLockName:    true,
+	}
+
 	for _, set := range update.Set {
 		for _, raw := range set.Prop.Raw {
 			xmlName, ok := raw.XMLName()
@@ -246,11 +277,23 @@ func (b *backend) PropPatch(c *fiber.Ctx, update *internal.PropertyUpdate) (*int
 
 			emptyVal := internal.NewRawXMLElement(xmlName, nil, nil)
 
-			if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
-				return nil, err
+			if protectedProps[xmlName] {
+				// Protected property - cannot be modified
+				if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
+					return nil, err
+				}
+			} else if modifiableProps[xmlName] {
+				// Modifiable property - allow modification
+				if err := resp.EncodeProp(fiber.StatusOK, emptyVal); err != nil {
+					return nil, err
+				}
+			} else {
+				// Unknown property - treat as not found
+				if err := resp.EncodeProp(fiber.StatusNotFound, emptyVal); err != nil {
+					return nil, err
+				}
 			}
 		}
-
 	}
 
 	for _, remove := range update.Remove {
@@ -262,11 +305,23 @@ func (b *backend) PropPatch(c *fiber.Ctx, update *internal.PropertyUpdate) (*int
 
 			emptyVal := internal.NewRawXMLElement(xmlName, nil, nil)
 
-			if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
-				return nil, err
+			if protectedProps[xmlName] {
+				// Protected property - cannot be removed
+				if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
+					return nil, err
+				}
+			} else if modifiableProps[xmlName] {
+				// Modifiable property - allow removal
+				if err := resp.EncodeProp(fiber.StatusOK, emptyVal); err != nil {
+					return nil, err
+				}
+			} else {
+				// Unknown property - treat as not found
+				if err := resp.EncodeProp(fiber.StatusNotFound, emptyVal); err != nil {
+					return nil, err
+				}
 			}
 		}
-
 	}
 
 	if len(resp.PropStats) == 0 {
@@ -285,7 +340,17 @@ func (b *backend) Put(c *fiber.Ctx) error {
 		IfNoneMatch: ifNoneMatch,
 		IfMatch:     ifMatch,
 	}
-	fi, created, err := b.FileSystem.Create(c.Context(), c.Path(), &bodyStreamWrapper{c.Request().BodyStream()}, &opts)
+
+	// Handle potential nil body stream
+	var body io.ReadCloser
+	bodyStream := c.Request().BodyStream()
+	if bodyStream != nil {
+		body = &bodyStreamWrapper{bodyStream}
+	} else {
+		body = &bodyStreamWrapper{strings.NewReader("")}
+	}
+
+	fi, created, err := b.FileSystem.Create(c.Context(), c.Path(), body, &opts)
 	if err != nil {
 		return err
 	}
@@ -294,7 +359,7 @@ func (b *backend) Put(c *fiber.Ctx) error {
 		c.Set("Content-Type", fi.MIMEType)
 	}
 	if !fi.ModTime.IsZero() {
-		c.Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
+		c.Set("Last-Modified", fi.ModTime.UTC().Format(TimeFormat))
 	}
 	if fi.ETag != "" {
 		c.Set("ETag", internal.ETag(fi.ETag).String())

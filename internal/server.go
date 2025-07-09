@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"mime"
-	"net/http"
 	"net/url"
 	"strings"
 	"time"
@@ -202,7 +201,7 @@ func NewPropFindResponse(path string, propfind *PropFind, props map[xml.Name]Pro
 	if propfind.PropName != nil {
 		for xmlName, _ := range props {
 			emptyVal := NewRawXMLElement(xmlName, nil, nil)
-			if err := resp.EncodeProp(http.StatusOK, emptyVal); err != nil {
+			if err := resp.EncodeProp(fiber.StatusOK, emptyVal); err != nil {
 				return nil, err
 			}
 		}
@@ -213,7 +212,7 @@ func NewPropFindResponse(path string, propfind *PropFind, props map[xml.Name]Pro
 
 			val, err := f(emptyVal)
 
-			code := http.StatusOK
+			code := fiber.StatusOK
 			if err != nil {
 				// TODO: don't throw away error message here
 				code = HTTPErrorFromError(err).Code
@@ -241,11 +240,11 @@ func NewPropFindResponse(path string, propfind *PropFind, props map[xml.Name]Pro
 					// TODO: don't throw away error message here
 					code = HTTPErrorFromError(err).Code
 				} else {
-					code = http.StatusOK
+					code = fiber.StatusOK
 					val = v
 				}
 			} else {
-				code = http.StatusNotFound
+				code = fiber.StatusNotFound
 			}
 
 			if err := resp.EncodeProp(code, val); err != nil {
@@ -253,7 +252,7 @@ func NewPropFindResponse(path string, propfind *PropFind, props map[xml.Name]Pro
 			}
 		}
 	} else {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: request missing propname, allprop or prop element")
+		return nil, HTTPErrorf(fiber.StatusBadRequest, "webdav: request missing propname, allprop or prop element")
 	}
 
 	return resp, nil
