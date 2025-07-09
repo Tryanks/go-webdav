@@ -26,6 +26,7 @@ func main() {
 
 	handler := webdav.Handler{
 		FileSystem: webdav.LocalFileSystem(path),
+		LockSystem: webdav.NewMemoryLockSystem(),
 	}
 	log.Printf("WebDAV server listening on %v", addr)
 	log.Fatal(http.ListenAndServe(addr, &handler))

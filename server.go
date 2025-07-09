@@ -25,10 +25,25 @@ type FileSystem interface {
 	Move(ctx context.Context, name, dest string, options *MoveOptions) (created bool, err error)
 }
 
+// LockSystem provides an interface for lock management implementations.
+// This allows users to implement their own lock storage
+type LockSystem interface {
+	// Lock attempts to create a new lock for the given path with specified parameters.
+	// Returns the lock information, whether it was created, and any error.
+	Lock(path string, depth internal.Depth, timeout time.Duration, refreshToken string) (lock *internal.Lock, created bool, err error)
+
+	// Unlock removes the lock identified by the given token.
+	Unlock(tokenHref string) error
+
+	// HasConflictingLock checks if there are conflicting locks for a path.
+	HasConflictingLock(path string, depth internal.Depth, excludeToken string) bool
+}
+
 // Handler handles WebDAV HTTP requests. It can be used to create a WebDAV
 // server.
 type Handler struct {
 	FileSystem FileSystem
+	LockSystem LockSystem
 }
 
 // ServeHTTP implements http.Handler.
@@ -38,7 +53,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	b := backend{h.FileSystem}
+	b := backend{h.FileSystem, h.LockSystem}
 	hh := internal.Handler{Backend: &b}
 	hh.ServeHTTP(w, r)
 }
@@ -54,6 +69,7 @@ func NewHTTPError(statusCode int, cause error) error {
 
 type backend struct {
 	FileSystem FileSystem
+	LockSystem LockSystem
 }
 
 func (b *backend) Options(r *http.Request) (caps []string, allow []string, err error) {
@@ -324,11 +340,11 @@ func (b *backend) Move(r *http.Request, dest *internal.Href, overwrite bool) (cr
 }
 
 func (b *backend) Lock(r *http.Request, depth internal.Depth, timeout time.Duration, refreshToken string) (lock *internal.Lock, created bool, err error) {
-	return nil, false, internal.HTTPErrorf(http.StatusMethodNotAllowed, "webdav: unsupported method")
+	return b.LockSystem.Lock(r.URL.Path, depth, timeout, refreshToken)
 }
 
 func (b *backend) Unlock(r *http.Request, tokenHref string) error {
-	return internal.HTTPErrorf(http.StatusMethodNotAllowed, "webdav: unsupported method")
+	return b.LockSystem.Unlock(tokenHref)
 }
 
 // BackendSuppliedHomeSet represents either a CalDAV calendar-home-set or a
