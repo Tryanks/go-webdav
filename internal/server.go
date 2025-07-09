@@ -4,16 +4,17 @@ import (
 	"encoding/xml"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/gofiber/fiber/v2"
 )
 
-func ServeError(w http.ResponseWriter, err error) {
-	code := http.StatusInternalServerError
+func ServeError(c *fiber.Ctx, err error) {
+	code := fiber.StatusInternalServerError
 	var httpErr *HTTPError
 	if errors.As(err, &httpErr) {
 		code = httpErr.Code
@@ -21,67 +22,68 @@ func ServeError(w http.ResponseWriter, err error) {
 
 	var errElt *Error
 	if errors.As(err, &errElt) {
-		w.WriteHeader(code)
-		ServeXML(w).Encode(errElt)
+		c.Status(code)
+		ServeXML(c).Encode(errElt)
 		return
 	}
 
-	http.Error(w, err.Error(), code)
+	c.Status(code).SendString(err.Error())
 }
 
-func isContentXML(h http.Header) bool {
-	t, _, _ := mime.ParseMediaType(h.Get("Content-Type"))
+func isContentXML(c *fiber.Ctx) bool {
+	t, _, _ := mime.ParseMediaType(c.Get("Content-Type"))
 	return t == "application/xml" || t == "text/xml"
 }
 
-func ensureRequestBodyEmpty(r *http.Request) error {
-	var b [1]byte
-	if _, err := r.Body.Read(b[:]); err != io.EOF {
-		return HTTPErrorf(http.StatusBadRequest, "webdav: unsupported request body")
+func ensureRequestBodyEmpty(c *fiber.Ctx) error {
+	body := c.Body()
+	if len(body) > 0 {
+		return HTTPErrorf(fiber.StatusBadRequest, "webdav: unsupported request body")
 	}
 	return nil
 }
 
-func DecodeXMLRequest(r *http.Request, v interface{}) error {
-	if !isContentXML(r.Header) {
-		return HTTPErrorf(http.StatusBadRequest, "webdav: expected application/xml request")
+func DecodeXMLRequest(c *fiber.Ctx, v interface{}) error {
+	if !isContentXML(c) {
+		return HTTPErrorf(fiber.StatusBadRequest, "webdav: expected application/xml request")
 	}
 
-	if err := xml.NewDecoder(r.Body).Decode(v); err != nil {
-		return &HTTPError{http.StatusBadRequest, err}
+	body := c.Body()
+	if err := xml.NewDecoder(strings.NewReader(string(body))).Decode(v); err != nil {
+		return &HTTPError{fiber.StatusBadRequest, err}
 	}
 	return nil
 }
 
-func IsRequestBodyEmpty(r *http.Request) bool {
-	_, err := r.Body.Read(nil)
-	return err == io.EOF
+func IsRequestBodyEmpty(c *fiber.Ctx) bool {
+	body := c.Body()
+	return len(body) == 0
 }
 
-func ServeXML(w http.ResponseWriter) *xml.Encoder {
-	w.Header().Add("Content-Type", "application/xml; charset=\"utf-8\"")
-	w.Write([]byte(xml.Header))
-	return xml.NewEncoder(w)
+func ServeXML(c *fiber.Ctx) *xml.Encoder {
+	c.Set("Content-Type", "application/xml; charset=\"utf-8\"")
+	c.Write([]byte(xml.Header))
+	return xml.NewEncoder(c.Response().BodyWriter())
 }
 
-func ServeMultiStatus(w http.ResponseWriter, ms *MultiStatus) error {
+func ServeMultiStatus(c *fiber.Ctx, ms *MultiStatus) error {
 	// TODO: streaming
-	w.WriteHeader(http.StatusMultiStatus)
-	return ServeXML(w).Encode(ms)
+	c.Status(fiber.StatusMultiStatus)
+	return ServeXML(c).Encode(ms)
 }
 
 type Backend interface {
-	Options(r *http.Request) (caps []string, allow []string, err error)
-	HeadGet(w http.ResponseWriter, r *http.Request) error
-	PropFind(r *http.Request, pf *PropFind, depth Depth) (*MultiStatus, error)
-	PropPatch(r *http.Request, pu *PropertyUpdate) (*Response, error)
-	Put(w http.ResponseWriter, r *http.Request) error
-	Delete(r *http.Request) error
-	Mkcol(r *http.Request) error
-	Copy(r *http.Request, dest *Href, recursive, overwrite bool) (created bool, err error)
-	Move(r *http.Request, dest *Href, overwrite bool) (created bool, err error)
-	Lock(r *http.Request, depth Depth, timeout time.Duration, refreshToken string) (lock *Lock, created bool, err error)
-	Unlock(r *http.Request, tokenHref string) error
+	Options(c *fiber.Ctx) (caps []string, allow []string, err error)
+	HeadGet(c *fiber.Ctx) error
+	PropFind(c *fiber.Ctx, pf *PropFind, depth Depth) (*MultiStatus, error)
+	PropPatch(c *fiber.Ctx, pu *PropertyUpdate) (*Response, error)
+	Put(c *fiber.Ctx) error
+	Delete(c *fiber.Ctx) error
+	Mkcol(c *fiber.Ctx) error
+	Copy(c *fiber.Ctx, dest *Href, recursive, overwrite bool) (created bool, err error)
+	Move(c *fiber.Ctx, dest *Href, overwrite bool) (created bool, err error)
+	Lock(c *fiber.Ctx, depth Depth, timeout time.Duration, refreshToken string) (lock *Lock, created bool, err error)
+	Unlock(c *fiber.Ctx, tokenHref string) error
 }
 
 type Lock struct {
@@ -94,90 +96,92 @@ type Handler struct {
 	Backend Backend
 }
 
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) Handle(c *fiber.Ctx) error {
 	var err error
 	if h.Backend == nil {
 		err = fmt.Errorf("webdav: no backend available")
 	} else {
-		switch r.Method {
-		case http.MethodOptions:
-			err = h.handleOptions(w, r)
-		case http.MethodGet, http.MethodHead:
-			err = h.Backend.HeadGet(w, r)
-		case http.MethodPut:
-			err = h.Backend.Put(w, r)
-		case http.MethodDelete:
+		switch c.Method() {
+		case fiber.MethodOptions:
+			err = h.handleOptions(c)
+		case fiber.MethodGet, fiber.MethodHead:
+			err = h.Backend.HeadGet(c)
+		case fiber.MethodPut:
+			err = h.Backend.Put(c)
+		case fiber.MethodDelete:
 			// TODO: send a multistatus in case of partial failure
-			err = h.Backend.Delete(r)
+			err = h.Backend.Delete(c)
 			if err == nil {
-				w.WriteHeader(http.StatusNoContent)
+				c.Status(fiber.StatusNoContent)
 			}
 		case "PROPFIND":
-			err = h.handlePropfind(w, r)
+			err = h.handlePropfind(c)
 		case "PROPPATCH":
-			err = h.handleProppatch(w, r)
+			err = h.handleProppatch(c)
 		case "MKCOL":
-			err = h.Backend.Mkcol(r)
+			err = h.Backend.Mkcol(c)
 			if err == nil {
-				w.WriteHeader(http.StatusCreated)
+				c.Status(fiber.StatusCreated)
 			}
 		case "COPY", "MOVE":
-			err = h.handleCopyMove(w, r)
+			err = h.handleCopyMove(c)
 		case "LOCK":
-			err = h.handleLock(w, r)
+			err = h.handleLock(c)
 		case "UNLOCK":
-			err = h.handleUnlock(w, r)
+			err = h.handleUnlock(c)
 		default:
-			err = HTTPErrorf(http.StatusMethodNotAllowed, "webdav: unsupported method")
+			err = HTTPErrorf(fiber.StatusMethodNotAllowed, "webdav: unsupported method")
 		}
 	}
 
 	if err != nil {
-		ServeError(w, err)
+		ServeError(c, err)
+		return err
 	}
+	return nil
 }
 
-func (h *Handler) handleOptions(w http.ResponseWriter, r *http.Request) error {
-	caps, allow, err := h.Backend.Options(r)
+func (h *Handler) handleOptions(c *fiber.Ctx) error {
+	caps, allow, err := h.Backend.Options(c)
 	if err != nil {
 		return err
 	}
 	caps = append([]string{"1", "3"}, caps...)
 
-	w.Header().Add("DAV", strings.Join(caps, ", "))
-	w.Header().Add("Allow", strings.Join(allow, ", "))
-	w.WriteHeader(http.StatusNoContent)
+	c.Set("DAV", strings.Join(caps, ", "))
+	c.Set("Allow", strings.Join(allow, ", "))
+	c.Status(fiber.StatusNoContent)
 	return nil
 }
 
-func (h *Handler) handlePropfind(w http.ResponseWriter, r *http.Request) error {
+func (h *Handler) handlePropfind(c *fiber.Ctx) error {
 	var propfind PropFind
-	if isContentXML(r.Header) {
-		if err := DecodeXMLRequest(r, &propfind); err != nil {
+	if isContentXML(c) {
+		if err := DecodeXMLRequest(c, &propfind); err != nil {
 			return err
 		}
 	} else {
-		if err := ensureRequestBodyEmpty(r); err != nil {
+		if err := ensureRequestBodyEmpty(c); err != nil {
 			return err
 		}
 		propfind.AllProp = &struct{}{}
 	}
 
 	depth := DepthInfinity
-	if s := r.Header.Get("Depth"); s != "" {
+	if s := c.Get("Depth"); s != "" {
 		var err error
 		depth, err = ParseDepth(s)
 		if err != nil {
-			return &HTTPError{http.StatusBadRequest, err}
+			return &HTTPError{fiber.StatusBadRequest, err}
 		}
 	}
 
-	ms, err := h.Backend.PropFind(r, &propfind, depth)
+	ms, err := h.Backend.PropFind(c, &propfind, depth)
 	if err != nil {
 		return err
 	}
 
-	return ServeMultiStatus(w, ms)
+	return ServeMultiStatus(c, ms)
 }
 
 type PropFindFunc func(raw *RawXMLValue) (interface{}, error)
@@ -255,41 +259,41 @@ func NewPropFindResponse(path string, propfind *PropFind, props map[xml.Name]Pro
 	return resp, nil
 }
 
-func (h *Handler) handleProppatch(w http.ResponseWriter, r *http.Request) error {
+func (h *Handler) handleProppatch(c *fiber.Ctx) error {
 	var update PropertyUpdate
-	if err := DecodeXMLRequest(r, &update); err != nil {
+	if err := DecodeXMLRequest(c, &update); err != nil {
 		return err
 	}
 
-	resp, err := h.Backend.PropPatch(r, &update)
+	resp, err := h.Backend.PropPatch(c, &update)
 	if err != nil {
 		return err
 	}
 
 	ms := NewMultiStatus(*resp)
-	return ServeMultiStatus(w, ms)
+	return ServeMultiStatus(c, ms)
 }
 
-func parseDestination(h http.Header) (*Href, error) {
-	destHref := h.Get("Destination")
+func parseDestination(c *fiber.Ctx) (*Href, error) {
+	destHref := c.Get("Destination")
 	if destHref == "" {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: missing Destination header in MOVE request")
+		return nil, HTTPErrorf(fiber.StatusBadRequest, "webdav: missing Destination header in MOVE request")
 	}
 	dest, err := url.Parse(destHref)
 	if err != nil {
-		return nil, HTTPErrorf(http.StatusBadRequest, "webdav: marlformed Destination header in MOVE request: %v", err)
+		return nil, HTTPErrorf(fiber.StatusBadRequest, "webdav: marlformed Destination header in MOVE request: %v", err)
 	}
 	return (*Href)(dest), nil
 }
 
-func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
-	dest, err := parseDestination(r.Header)
+func (h *Handler) handleCopyMove(c *fiber.Ctx) error {
+	dest, err := parseDestination(c)
 	if err != nil {
 		return err
 	}
 
 	overwrite := true
-	if s := r.Header.Get("Overwrite"); s != "" {
+	if s := c.Get("Overwrite"); s != "" {
 		overwrite, err = ParseOverwrite(s)
 		if err != nil {
 			return err
@@ -297,7 +301,7 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	depth := DepthInfinity
-	if s := r.Header.Get("Depth"); s != "" {
+	if s := c.Get("Depth"); s != "" {
 		depth, err = ParseDepth(s)
 		if err != nil {
 			return err
@@ -305,85 +309,85 @@ func (h *Handler) handleCopyMove(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	var created bool
-	if r.Method == "COPY" {
+	if c.Method() == "COPY" {
 		var recursive bool
 		switch depth {
 		case DepthZero:
 			recursive = false
 		case DepthOne:
-			return HTTPErrorf(http.StatusBadRequest, `webdav: "Depth: 1" is not supported in COPY request`)
+			return HTTPErrorf(fiber.StatusBadRequest, `webdav: "Depth: 1" is not supported in COPY request`)
 		case DepthInfinity:
 			recursive = true
 		}
 
-		created, err = h.Backend.Copy(r, dest, recursive, overwrite)
+		created, err = h.Backend.Copy(c, dest, recursive, overwrite)
 	} else {
 		if depth != DepthInfinity {
-			return HTTPErrorf(http.StatusBadRequest, `webdav: only "Depth: infinity" is accepted in MOVE request`)
+			return HTTPErrorf(fiber.StatusBadRequest, `webdav: only "Depth: infinity" is accepted in MOVE request`)
 		}
-		created, err = h.Backend.Move(r, dest, overwrite)
+		created, err = h.Backend.Move(c, dest, overwrite)
 	}
 	if err != nil {
 		return err
 	}
 
 	if created {
-		w.WriteHeader(http.StatusCreated)
+		c.Status(fiber.StatusCreated)
 	} else {
-		w.WriteHeader(http.StatusNoContent)
+		c.Status(fiber.StatusNoContent)
 	}
 	return nil
 }
 
-func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) error {
+func (h *Handler) handleLock(c *fiber.Ctx) error {
 	var (
 		lockInfo     LockInfo
 		refreshToken string
 	)
-	if isContentXML(r.Header) {
-		if err := DecodeXMLRequest(r, &lockInfo); err != nil {
+	if isContentXML(c) {
+		if err := DecodeXMLRequest(c, &lockInfo); err != nil {
 			return err
 		}
 	} else {
-		if err := ensureRequestBodyEmpty(r); err != nil {
+		if err := ensureRequestBodyEmpty(c); err != nil {
 			return err
 		}
 
-		conditions, err := ParseConditions(r.Header.Get("If"))
+		conditions, err := ParseConditions(c.Get("If"))
 		if err != nil {
-			return &HTTPError{http.StatusBadRequest, err}
+			return &HTTPError{fiber.StatusBadRequest, err}
 		} else if len(conditions) != 1 || len(conditions[0]) != 1 || conditions[0][0].Token == "" {
-			return HTTPErrorf(http.StatusBadRequest, "webdav: a single lock token must be specified in the If header field")
+			return HTTPErrorf(fiber.StatusBadRequest, "webdav: a single lock token must be specified in the If header field")
 		}
 		refreshToken = conditions[0][0].Token
 	}
 
 	if lockInfo.LockScope.Exclusive == nil || lockInfo.LockScope.Shared != nil {
-		return HTTPErrorf(http.StatusBadRequest, "webdav: only exclusive locks are supported")
+		return HTTPErrorf(fiber.StatusBadRequest, "webdav: only exclusive locks are supported")
 	}
 	if lockInfo.LockType.Write == nil {
-		return HTTPErrorf(http.StatusBadRequest, "webdav: only write locks are supported")
+		return HTTPErrorf(fiber.StatusBadRequest, "webdav: only write locks are supported")
 	}
 
 	depth := DepthInfinity
-	if s := r.Header.Get("Depth"); s != "" {
+	if s := c.Get("Depth"); s != "" {
 		var err error
 		depth, err = ParseDepth(s)
 		if err != nil {
-			return &HTTPError{http.StatusBadRequest, err}
+			return &HTTPError{fiber.StatusBadRequest, err}
 		}
 	}
 
 	var timeout time.Duration
-	if s := r.Header.Get("Timeout"); s != "" {
+	if s := c.Get("Timeout"); s != "" {
 		t, err := ParseTimeout(s)
 		if err != nil {
-			return &HTTPError{http.StatusBadRequest, err}
+			return &HTTPError{fiber.StatusBadRequest, err}
 		}
 		timeout = t.Duration
 	}
 
-	lock, created, err := h.Backend.Lock(r, depth, timeout, refreshToken)
+	lock, created, err := h.Backend.Lock(c, depth, timeout, refreshToken)
 	if err != nil {
 		return err
 	}
@@ -415,26 +419,26 @@ func (h *Handler) handleLock(w http.ResponseWriter, r *http.Request) error {
 	}
 
 	if refreshToken == "" {
-		w.Header().Set("Lock-Token", FormatLockToken(lock.Href))
+		c.Set("Lock-Token", FormatLockToken(lock.Href))
 	}
 	if created {
-		w.WriteHeader(http.StatusCreated)
+		c.Status(fiber.StatusCreated)
 	} else {
-		w.WriteHeader(http.StatusOK)
+		c.Status(fiber.StatusOK)
 	}
-	return ServeXML(w).Encode(prop)
+	return ServeXML(c).Encode(prop)
 }
 
-func (h *Handler) handleUnlock(w http.ResponseWriter, r *http.Request) error {
-	tokenHref, err := ParseLockToken(r.Header.Get("Lock-Token"))
+func (h *Handler) handleUnlock(c *fiber.Ctx) error {
+	tokenHref, err := ParseLockToken(c.Get("Lock-Token"))
 	if err != nil {
-		return &HTTPError{http.StatusBadRequest, err}
+		return &HTTPError{fiber.StatusBadRequest, err}
 	}
 
-	if err := h.Backend.Unlock(r, tokenHref); err != nil {
+	if err := h.Backend.Unlock(c, tokenHref); err != nil {
 		return err
 	}
 
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(fiber.StatusNoContent)
 	return nil
 }

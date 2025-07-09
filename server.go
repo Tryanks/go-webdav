@@ -11,7 +11,18 @@ import (
 	"time"
 
 	"github.com/emersion/go-webdav/internal"
+	"github.com/gofiber/fiber/v2"
 )
+
+// bodyStreamWrapper wraps an io.Reader to implement io.ReadCloser
+type bodyStreamWrapper struct {
+	io.Reader
+}
+
+func (b *bodyStreamWrapper) Close() error {
+	// Fiber's body stream doesn't need explicit closing
+	return nil
+}
 
 // FileSystem is a WebDAV server backend.
 type FileSystem interface {
@@ -46,16 +57,15 @@ type Handler struct {
 	LockSystem LockSystem
 }
 
-// ServeHTTP implements http.Handler.
-func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+// Handle implements fiber handler.
+func (h *Handler) Handle(c *fiber.Ctx) error {
 	if h.FileSystem == nil {
-		http.Error(w, "webdav: no filesystem available", http.StatusInternalServerError)
-		return
+		return c.Status(fiber.StatusInternalServerError).SendString("webdav: no filesystem available")
 	}
 
 	b := backend{h.FileSystem, h.LockSystem}
 	hh := internal.Handler{Backend: &b}
-	hh.ServeHTTP(w, r)
+	return hh.Handle(c)
 }
 
 // NewHTTPError creates a new error that is associated with an HTTP status code
@@ -72,79 +82,84 @@ type backend struct {
 	LockSystem LockSystem
 }
 
-func (b *backend) Options(r *http.Request) (caps []string, allow []string, err error) {
+func (b *backend) Options(c *fiber.Ctx) (caps []string, allow []string, err error) {
 	caps = []string{"2"}
 
-	fi, err := b.FileSystem.Stat(r.Context(), r.URL.Path)
+	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
 	if internal.IsNotFound(err) {
-		return caps, []string{http.MethodOptions, http.MethodPut, "MKCOL"}, nil
+		return caps, []string{fiber.MethodOptions, fiber.MethodPut, "MKCOL"}, nil
 	} else if err != nil {
 		return nil, nil, err
 	}
 
 	allow = []string{
-		http.MethodOptions,
-		http.MethodDelete,
+		fiber.MethodOptions,
+		fiber.MethodDelete,
 		"PROPFIND",
 		"COPY",
 		"MOVE",
 	}
 
 	if !fi.IsDir {
-		allow = append(allow, http.MethodHead, http.MethodGet, http.MethodPut)
+		allow = append(allow, fiber.MethodHead, fiber.MethodGet, fiber.MethodPut)
 	}
 
 	return caps, allow, nil
 }
 
-func (b *backend) HeadGet(w http.ResponseWriter, r *http.Request) error {
-	fi, err := b.FileSystem.Stat(r.Context(), r.URL.Path)
+func (b *backend) HeadGet(c *fiber.Ctx) error {
+	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
 	if err != nil {
 		return err
 	}
 	if fi.IsDir {
-		return &internal.HTTPError{Code: http.StatusMethodNotAllowed}
+		return &internal.HTTPError{Code: fiber.StatusMethodNotAllowed}
 	}
 
-	f, err := b.FileSystem.Open(r.Context(), r.URL.Path)
+	f, err := b.FileSystem.Open(c.Context(), c.Path())
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 
-	w.Header().Set("Content-Length", strconv.FormatInt(fi.Size, 10))
+	c.Set("Content-Length", strconv.FormatInt(fi.Size, 10))
 	if fi.MIMEType != "" {
-		w.Header().Set("Content-Type", fi.MIMEType)
+		c.Set("Content-Type", fi.MIMEType)
 	}
 	if !fi.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
+		c.Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
 	}
 	if fi.ETag != "" {
-		w.Header().Set("ETag", internal.ETag(fi.ETag).String())
+		c.Set("ETag", internal.ETag(fi.ETag).String())
 	}
 
 	if rs, ok := f.(io.ReadSeeker); ok {
-		// If it's an io.Seeker, use http.ServeContent which supports ranges
-		http.ServeContent(w, r, r.URL.Path, fi.ModTime, rs)
+		// For io.ReadSeeker, we need to handle ranges manually in Fiber
+		// For now, just copy the content
+		if c.Method() != fiber.MethodHead {
+			_, err = io.Copy(c.Response().BodyWriter(), rs)
+			return err
+		}
 	} else {
-		if r.Method != http.MethodHead {
-			io.Copy(w, f)
+		if c.Method() != fiber.MethodHead {
+			_, err = io.Copy(c.Response().BodyWriter(), f)
+			return err
 		}
 	}
 	return nil
 }
 
-func (b *backend) PropFind(r *http.Request, propfind *internal.PropFind, depth internal.Depth) (*internal.MultiStatus, error) {
+func (b *backend) PropFind(c *fiber.Ctx, propfind *internal.PropFind, depth internal.Depth) (*internal.MultiStatus, error) {
 	// TODO: use partial error Response on error
 
-	fi, err := b.FileSystem.Stat(r.Context(), r.URL.Path)
+	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
 	if err != nil {
 		return nil, err
 	}
 
 	var resps []internal.Response
 	if depth != internal.DepthZero && fi.IsDir {
-		children, err := b.FileSystem.ReadDir(r.Context(), r.URL.Path, depth == internal.DepthInfinity)
+		children, err := b.FileSystem.ReadDir(c.Context(), c.Path(), depth == internal.DepthInfinity)
 		if err != nil {
 			return nil, err
 		}
@@ -214,8 +229,8 @@ func (b *backend) propFindFile(propfind *internal.PropFind, fi *FileInfo) (*inte
 	return internal.NewPropFindResponse(fi.Path, propfind, props)
 }
 
-func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*internal.Response, error) {
-	fi, err := b.FileSystem.Stat(r.Context(), r.URL.Path)
+func (b *backend) PropPatch(c *fiber.Ctx, update *internal.PropertyUpdate) (*internal.Response, error) {
+	fi, err := b.FileSystem.Stat(c.Context(), c.Path())
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +246,7 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 
 			emptyVal := internal.NewRawXMLElement(xmlName, nil, nil)
 
-			if err := resp.EncodeProp(http.StatusForbidden, emptyVal); err != nil {
+			if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
 				return nil, err
 			}
 		}
@@ -247,7 +262,7 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 
 			emptyVal := internal.NewRawXMLElement(xmlName, nil, nil)
 
-			if err := resp.EncodeProp(http.StatusForbidden, emptyVal); err != nil {
+			if err := resp.EncodeProp(fiber.StatusForbidden, emptyVal); err != nil {
 				return nil, err
 			}
 		}
@@ -255,95 +270,95 @@ func (b *backend) PropPatch(r *http.Request, update *internal.PropertyUpdate) (*
 	}
 
 	if len(resp.PropStats) == 0 {
-		return nil, internal.HTTPErrorf(http.StatusBadRequest,
+		return nil, internal.HTTPErrorf(fiber.StatusBadRequest,
 			"webdav: request missing properties to update")
 	}
 
 	return resp, nil
 }
 
-func (b *backend) Put(w http.ResponseWriter, r *http.Request) error {
-	ifNoneMatch := ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := ConditionalMatch(r.Header.Get("If-Match"))
+func (b *backend) Put(c *fiber.Ctx) error {
+	ifNoneMatch := ConditionalMatch(c.Get("If-None-Match"))
+	ifMatch := ConditionalMatch(c.Get("If-Match"))
 
 	opts := CreateOptions{
 		IfNoneMatch: ifNoneMatch,
 		IfMatch:     ifMatch,
 	}
-	fi, created, err := b.FileSystem.Create(r.Context(), r.URL.Path, r.Body, &opts)
+	fi, created, err := b.FileSystem.Create(c.Context(), c.Path(), &bodyStreamWrapper{c.Request().BodyStream()}, &opts)
 	if err != nil {
 		return err
 	}
 
 	if fi.MIMEType != "" {
-		w.Header().Set("Content-Type", fi.MIMEType)
+		c.Set("Content-Type", fi.MIMEType)
 	}
 	if !fi.ModTime.IsZero() {
-		w.Header().Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
+		c.Set("Last-Modified", fi.ModTime.UTC().Format(http.TimeFormat))
 	}
 	if fi.ETag != "" {
-		w.Header().Set("ETag", internal.ETag(fi.ETag).String())
+		c.Set("ETag", internal.ETag(fi.ETag).String())
 	}
 
 	if created {
-		w.WriteHeader(http.StatusCreated)
+		c.Status(fiber.StatusCreated)
 	} else {
-		w.WriteHeader(http.StatusNoContent)
+		c.Status(fiber.StatusNoContent)
 	}
 
 	return nil
 }
 
-func (b *backend) Delete(r *http.Request) error {
-	ifNoneMatch := ConditionalMatch(r.Header.Get("If-None-Match"))
-	ifMatch := ConditionalMatch(r.Header.Get("If-Match"))
+func (b *backend) Delete(c *fiber.Ctx) error {
+	ifNoneMatch := ConditionalMatch(c.Get("If-None-Match"))
+	ifMatch := ConditionalMatch(c.Get("If-Match"))
 
 	opts := RemoveAllOptions{
 		IfNoneMatch: ifNoneMatch,
 		IfMatch:     ifMatch,
 	}
-	return b.FileSystem.RemoveAll(r.Context(), r.URL.Path, &opts)
+	return b.FileSystem.RemoveAll(c.Context(), c.Path(), &opts)
 }
 
-func (b *backend) Mkcol(r *http.Request) error {
-	if r.Header.Get("Content-Type") != "" {
-		return internal.HTTPErrorf(http.StatusUnsupportedMediaType, "webdav: request body not supported in MKCOL request")
+func (b *backend) Mkcol(c *fiber.Ctx) error {
+	if c.Get("Content-Type") != "" {
+		return internal.HTTPErrorf(fiber.StatusUnsupportedMediaType, "webdav: request body not supported in MKCOL request")
 	}
-	err := b.FileSystem.Mkdir(r.Context(), r.URL.Path)
+	err := b.FileSystem.Mkdir(c.Context(), c.Path())
 	if internal.IsNotFound(err) {
-		return &internal.HTTPError{Code: http.StatusConflict, Err: err}
+		return &internal.HTTPError{Code: fiber.StatusConflict, Err: err}
 	}
 	return err
 }
 
-func (b *backend) Copy(r *http.Request, dest *internal.Href, recursive, overwrite bool) (created bool, err error) {
+func (b *backend) Copy(c *fiber.Ctx, dest *internal.Href, recursive, overwrite bool) (created bool, err error) {
 	options := CopyOptions{
 		NoRecursive: !recursive,
 		NoOverwrite: !overwrite,
 	}
-	created, err = b.FileSystem.Copy(r.Context(), r.URL.Path, dest.Path, &options)
+	created, err = b.FileSystem.Copy(c.Context(), c.Path(), dest.Path, &options)
 	if os.IsExist(err) {
-		return false, &internal.HTTPError{http.StatusPreconditionFailed, err}
+		return false, &internal.HTTPError{fiber.StatusPreconditionFailed, err}
 	}
 	return created, err
 }
 
-func (b *backend) Move(r *http.Request, dest *internal.Href, overwrite bool) (created bool, err error) {
+func (b *backend) Move(c *fiber.Ctx, dest *internal.Href, overwrite bool) (created bool, err error) {
 	options := MoveOptions{
 		NoOverwrite: !overwrite,
 	}
-	created, err = b.FileSystem.Move(r.Context(), r.URL.Path, dest.Path, &options)
+	created, err = b.FileSystem.Move(c.Context(), c.Path(), dest.Path, &options)
 	if os.IsExist(err) {
-		return false, &internal.HTTPError{http.StatusPreconditionFailed, err}
+		return false, &internal.HTTPError{fiber.StatusPreconditionFailed, err}
 	}
 	return created, err
 }
 
-func (b *backend) Lock(r *http.Request, depth internal.Depth, timeout time.Duration, refreshToken string) (lock *internal.Lock, created bool, err error) {
-	return b.LockSystem.Lock(r.URL.Path, depth, timeout, refreshToken)
+func (b *backend) Lock(c *fiber.Ctx, depth internal.Depth, timeout time.Duration, refreshToken string) (lock *internal.Lock, created bool, err error) {
+	return b.LockSystem.Lock(c.Path(), depth, timeout, refreshToken)
 }
 
-func (b *backend) Unlock(r *http.Request, tokenHref string) error {
+func (b *backend) Unlock(c *fiber.Ctx, tokenHref string) error {
 	return b.LockSystem.Unlock(tokenHref)
 }
 
@@ -373,29 +388,32 @@ type ServePrincipalOptions struct {
 }
 
 // ServePrincipal replies to requests for a principal URL.
-func ServePrincipal(w http.ResponseWriter, r *http.Request, options *ServePrincipalOptions) {
-	switch r.Method {
-	case http.MethodOptions:
+func ServePrincipal(c *fiber.Ctx, options *ServePrincipalOptions) error {
+	switch c.Method() {
+	case fiber.MethodOptions:
 		caps := []string{"1", "3"}
-		for _, c := range options.Capabilities {
-			caps = append(caps, string(c))
+		for _, cap := range options.Capabilities {
+			caps = append(caps, string(cap))
 		}
-		allow := []string{http.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}
-		w.Header().Add("DAV", strings.Join(caps, ", "))
-		w.Header().Add("Allow", strings.Join(allow, ", "))
-		w.WriteHeader(http.StatusNoContent)
+		allow := []string{fiber.MethodOptions, "PROPFIND", "REPORT", "DELETE", "MKCOL"}
+		c.Set("DAV", strings.Join(caps, ", "))
+		c.Set("Allow", strings.Join(allow, ", "))
+		c.Status(fiber.StatusNoContent)
+		return nil
 	case "PROPFIND":
-		if err := servePrincipalPropfind(w, r, options); err != nil {
-			internal.ServeError(w, err)
+		if err := servePrincipalPropfind(c, options); err != nil {
+			internal.ServeError(c, err)
+			return err
 		}
+		return nil
 	default:
-		http.Error(w, "unsupported method", http.StatusMethodNotAllowed)
+		return c.Status(fiber.StatusMethodNotAllowed).SendString("unsupported method")
 	}
 }
 
-func servePrincipalPropfind(w http.ResponseWriter, r *http.Request, options *ServePrincipalOptions) error {
+func servePrincipalPropfind(c *fiber.Ctx, options *ServePrincipalOptions) error {
 	var propfind internal.PropFind
-	if err := internal.DecodeXMLRequest(r, &propfind); err != nil {
+	if err := internal.DecodeXMLRequest(c, &propfind); err != nil {
 		return err
 	}
 	props := map[xml.Name]internal.PropFindFunc{
@@ -416,11 +434,11 @@ func servePrincipalPropfind(w http.ResponseWriter, r *http.Request, options *Ser
 		}
 	}
 
-	resp, err := internal.NewPropFindResponse(r.URL.Path, &propfind, props)
+	resp, err := internal.NewPropFindResponse(c.Path(), &propfind, props)
 	if err != nil {
 		return err
 	}
 
 	ms := internal.NewMultiStatus(*resp)
-	return internal.ServeMultiStatus(w, ms)
+	return internal.ServeMultiStatus(c, ms)
 }
